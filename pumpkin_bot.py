@@ -20,9 +20,15 @@ APPROACH_DISTANCE = 1.5
 EYE_HEIGHT = 1.62
 PITCH_CORRECTION_FACTOR = 0.85
 INVENTORY_CAPACITY = 36
+STUCK_TIME = 2.0         # po ilu sekundach braku ruchu uznajemy zacięcie
+MIN_DIST_CHANGE = 0.1    # minimalna zmiana odległości, by uznać ruch
+YAW_SCAN_RANGE = 15      # szerokość stożka w poziomie
+PITCH_SCAN_RANGE = 10    # wysokość stożka stożka
+YAW_STEP = 2
+PITCH_STEP = 3
 
 # --- DEBUG ---
-DEBUG = True  # ustaw na False, żeby wyciszyć debugowe echo
+DEBUG = True  # ustaw False, żeby wyciszyć debugowe echo
 
 # ================================================================
 # STAN I SYNCHRONIZACJA
@@ -71,25 +77,14 @@ def _compute_yaw_to_target(player_pos, target_pos, current_yaw=None):
 # PLACEHOLDERS: DURABILITY / EKWIPUNEK
 # ================================================================
 def check_tool_durability():
-    """
-    PLACEHOLDER: kontrola trwałości narzędzia (main_hand).
-    Zaimplementuj parsowanie NBT lub inne sprawdzenie, gdy API to umożliwi.
-    Zwraca True jeśli trwałość wymaga zatrzymania bota.
-    """
     debug("Durability check placeholder (no-op).")
     return False
 
 def check_inventory_status():
-    """
-    PLACEHOLDER: wykrywanie pełnego ekwipunku.
-    - obsługuje zarówno listę z None jak i listę zawierającą tylko niepuste sloty.
-    Zwraca True jeśli wymagane jest zatrzymanie bota.
-    """
     try:
         inv = ms.player_inventory()
         if inv is None:
             return False
-
         contains_none = any(item is None for item in inv)
         if contains_none:
             total_slots = len(inv)
@@ -121,9 +116,32 @@ def stop_all_actions():
 def go_and_destroy_target():
     """
     Podejdź do celu, koryguj yaw/pitch względem środka bloku, zniszcz blok.
-    (W tej wersji - BEZ timeoutów. Prosty flow: podejdź → atakuj dopóki blok istnieje.)
+    Dynamiczne przełączanie na bliższe cele: jeśli podczas podejścia/ataku
+    pojawi się inna poprawna dynia, bliższa od obecnego targetu o co najmniej
+    CLOSE_SWITCH_THRESHOLD, to przełączamy cel.
+    (Zachowuje placeholders durability/inventory i DEBUG.)
     """
     global bot_active
+    # próg (metry) — jeśli pojawi się target bliższy o co najmniej tą wartość, przełączamy
+    CLOSE_SWITCH_THRESHOLD = 0.6
+
+    def _get_pos_from_target(target):
+        """Zwraca tuple (x,y,z) lub None jeśli nie da się odczytać."""
+        if not target:
+            return None
+        try:
+            if hasattr(target, "position"):
+                p = target.position
+                if hasattr(p, "x"):
+                    return (p.x, p.y, p.z)
+                else:
+                    return tuple(p)
+            elif isinstance(target, dict):
+                return (target["x"], target["y"], target["z"])
+        except Exception:
+            return None
+        return None
+
     try:
         ms.echo("§e[Skaner] Cel namierzony — podchodzę i niszczę...")
         scanning_allowed.clear()
@@ -134,36 +152,25 @@ def go_and_destroy_target():
             scanning_allowed.set()
             return
 
-        # Pobierz pozycję celu (kompatybilnie z różnymi formatami)
-        try:
-            if hasattr(targeted, "position"):
-                tpos = targeted.position
-                if hasattr(tpos, "x"):
-                    tx, ty, tz = tpos.x, tpos.y, tpos.z
-                else:
-                    tx, ty, tz = tuple(tpos)
-            elif isinstance(targeted, dict):
-                tx, ty, tz = targeted["x"], targeted["y"], targeted["z"]
-            else:
-                raise ValueError("Nieznany format targetu")
-        except Exception as e:
-            ms.echo(f"§c[Skaner] Nie udało się odczytać pozycji bloku: {e}")
+        # pobierz początkową pozycję targetu
+        tpos = _get_pos_from_target(targeted)
+        if not tpos:
+            ms.echo("§c[Skaner] Nieznany format pozycji targetu — przerwanie.")
             scanning_allowed.set()
             return
+        tx, ty, tz = tpos
 
         # zapamiętaj pitch w momencie wykrycia
         _, pitch_base = ms.player_orientation()
 
-        # --- Podejście do celu ---
+                # Podejście do celu z detekcją zablokowania
+        last_distance = None
+        last_move_time = time.time()
+        STUCK_TIME = 2.0         # po ilu sekundach uznajemy, że bot się zaciął
+        MIN_DIST_CHANGE = 0.1    # minimalna zmiana odległości, żeby uznać że się ruszył
+
         while bot_active:
-            # opcjonalne kontrole (placeholders)
-            if check_tool_durability():
-                ms.echo("§c[Skaner] Durability wymaga interwencji — wstrzymuję bota.")
-                bot_active = False
-                stop_all_actions()
-                break
-            if check_inventory_status():
-                ms.echo("§c[Skaner] Inventory wymaga interwencji — wstrzymuję bota.")
+            if check_tool_durability() or check_inventory_status():
                 bot_active = False
                 stop_all_actions()
                 break
@@ -175,17 +182,84 @@ def go_and_destroy_target():
             dx, dz, dy = bx - px, bz - pz, by - eye_y
             horiz_dist = math.hypot(dx, dz)
 
+            # --- Wykrywanie zablokowania ---
+            now = time.time()
+            if last_distance is not None:
+                # wykrycie ruchu lub zastoju
+                if abs(horiz_dist - last_distance) > MIN_DIST_CHANGE:
+                    last_move_time = now
+                elif now - last_move_time > STUCK_TIME:
+                    ms.echo("§c[Skaner] Bot utknął — próbuję znaleźć nowy cel w pobliżu.")
+
+                    current_yaw, current_pitch = ms.player_orientation()
+                    best_target = None
+                    best_distance = float("inf")
+
+                    # płynny mini-skan — stożek wokół aktualnego kierunku
+                    for yaw_offset in range(-YAW_SCAN_RANGE, YAW_SCAN_RANGE + 1, YAW_STEP):
+                        for pitch_offset in range(-PITCH_SCAN_RANGE, PITCH_SCAN_RANGE + 1, PITCH_STEP):
+                            target_yaw = current_yaw + yaw_offset
+                            target_pitch = current_pitch + pitch_offset
+
+                            # płynne przejście (4 kroki)
+                            for interp in range(1, 5):
+                                intermediate_yaw = current_yaw + (target_yaw - current_yaw) * (interp / 4.0)
+                                intermediate_pitch = current_pitch + (target_pitch - current_pitch) * (interp / 4.0)
+                                ms.player_set_orientation(intermediate_yaw, intermediate_pitch)
+                                time.sleep(0.01)
+
+                            t = ms.player_get_targeted_block(max_distance=MAX_SCAN_DISTANCE)
+                            if t and getattr(t, "type", None) == TARGET_BLOCK:
+                                pos = _get_pos_from_target(t)
+                                if pos:
+                                    dist = math.dist(ms.player_position(), pos)
+                                    if dist < best_distance:
+                                        best_distance = dist
+                                        best_target = pos
+
+                            time.sleep(0.02)  # chwilka na stabilizację
+
+                    # powrót do pozycji początkowej
+                    for interp in range(1, 6):
+                        yaw_interp = current_yaw + (current_yaw - ms.player_orientation()[0]) * (interp / 5.0)
+                        pitch_interp = current_pitch + (current_pitch - ms.player_orientation()[1]) * (interp / 5.0)
+                        ms.player_set_orientation(yaw_interp, pitch_interp)
+                        time.sleep(0.01)
+
+                    if best_target:
+                        tx, ty, tz = best_target
+                        ms.echo(f"§e[Skaner] Nowy cel po zacięciu: {tx:.1f}, {ty:.1f}, {tz:.1f}")
+                        last_move_time = now
+                        last_distance = horiz_dist
+                        continue
+
+                    # jeśli nie znaleziono nowego celu — porzucamy
+                    ms.echo("§4[Skaner] Brak nowych celów — porzucam i wracam do skanowania.")
+                    stop_all_actions()
+                    yaw_now, pitch_now = ms.player_orientation()
+                    scanner_state.update({
+                        "current_yaw": _normalize_angle(yaw_now + 10),
+                        "current_pitch": pitch_now,
+                        "pitch_direction": "UP"
+                    })
+                    scanning_allowed.set()
+                    destroy_thread_running.clear()
+                    return
+
+
+            last_distance = horiz_dist
+
             if horiz_dist <= APPROACH_DISTANCE:
                 ms.player_press_forward(False)
                 break
 
+            # Korekcja yaw/pitch jak wcześniej
             cur_yaw, cur_pitch = ms.player_orientation()
             desired_yaw = _compute_yaw_to_target((px, py, pz), (tx, ty, tz), cur_yaw)
-
             pitch_target = pitch_base - math.degrees(math.atan2(dy, horiz_dist)) * PITCH_CORRECTION_FACTOR
             pitch_target = max(PITCH_MIN, min(PITCH_MAX, pitch_target))
 
-            # płynna zmiana pitch (5 kroków)
+            # płynna zmiana pitch
             step = (pitch_target - cur_pitch) / 5.0
             for _ in range(5):
                 cur_pitch += step
@@ -193,7 +267,6 @@ def go_and_destroy_target():
                 time.sleep(0.02)
 
             ms.player_press_forward(True)
-            debug(f"Podejście: dist={horiz_dist:.2f}, yaw={desired_yaw:.2f}, pitch_target={pitch_target:.2f}")
             time.sleep(0.05)
 
         if not bot_active:
@@ -203,30 +276,53 @@ def go_and_destroy_target():
             ms.echo("§c[Skaner] Podejście przerwane.")
             return
 
-        # --- Niszczenie (PROSTE: atakuj dopóki blok istnieje) ---
+        # --- Atak (również dynamiczne przełączanie jeśli pojawi się bliższy) ---
         ms.echo("§e[Skaner] Atakuję blok...")
         ms.player_press_attack(True)
 
         while bot_active:
-            t = ms.player_get_targeted_block(max_distance=2)
-            if not t or getattr(t, "type", None) != TARGET_BLOCK:
-                # blok zniknął / zniszczono / stracono
+            # sprawdzamy bieżący blok w celowniku
+            current = ms.player_get_targeted_block(max_distance=2)
+            cur_pos = _get_pos_from_target(current)
+
+            px, py, pz = ms.player_position()
+
+            # jeśli aktualny look jest pumpkin, policz jego odległość
+            if cur_pos and getattr(current, "type", None) == TARGET_BLOCK:
+                nx, ny, nz = cur_pos
+                nx_center_x, nx_center_y, nx_center_z = nx + 0.5, ny + 0.5, nz + 0.5
+                new_horiz = math.hypot(nx_center_x - px, nx_center_z - pz)
+                # odległość do obecnego targeta (środek)
+                bx, bz = tx + 0.5, tz + 0.5
+                old_horiz = math.hypot(bx - px, bz - pz)
+                # jeśli aktualny widoczny jest wyraźnie bliższy -> switch
+                if new_horiz + CLOSE_SWITCH_THRESHOLD < old_horiz:
+                    ms.echo(f"§e[Skaner] (Atak) przełączam na bliższy target: {new_horiz:.2f} < {old_horiz:.2f}")
+                    tx, ty, tz = nx, ny, nz
+                    # ustaw orientację tak, by patrzeć na nowy cel
+                    cur_yaw, cur_pitch = ms.player_orientation()
+                    desired_yaw = _compute_yaw_to_target((px, py, pz), (tx, ty, tz), cur_yaw)
+                    ms.player_set_orientation(desired_yaw, cur_pitch)
+
+            # jeśli w celowniku nie ma targetu lub inny typ -> zakończ atak (blok znikł/został zniszczony)
+            current_check = ms.player_get_targeted_block(max_distance=2)
+            if not current_check or getattr(current_check, "type", None) != TARGET_BLOCK:
                 ms.echo("§a[Skaner] Cel zniszczony lub utracony.")
                 break
-            # opcjonalnie można tu dodać małe opóźnienie lub monitoring
+
             time.sleep(LOOP_DELAY_SECONDS)
 
         ms.player_press_attack(False)
         stop_all_actions()
 
-        # --- Jeśli kolejny blok w tej samej linii, kontynuuj w nowym wątku ---
+        # --- Czy jest kolejny blok linia wzroku? Kontynuuj w nowym wątku ---
         next_target = ms.player_get_targeted_block(max_distance=MAX_SCAN_DISTANCE)
         if next_target and getattr(next_target, "type", None) == TARGET_BLOCK:
             ms.echo("§e[Skaner] Kolejny cel wykryty — kontynuuję niszczenie bez skanowania!")
             threading.Thread(target=go_and_destroy_target, daemon=True).start()
-            return  # ważne: return -> nowy wątek przejmuje działanie
+            return
 
-        # --- Restart skanowania: yaw-15, pitch -> PITCH_MAX, kierunek UP ---
+        # --- Reset orientacji po zniszczeniu ---
         yaw_now, _ = ms.player_orientation()
         new_yaw = _normalize_angle(yaw_now - 15)
         scanner_state.update({
